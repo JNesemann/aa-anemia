@@ -1,0 +1,386 @@
+---
+title: "SWIFT spatial: spatial and temporal autocorrelation"
+author: "Christine Tedijanto christine.tedijanto@ucsf.edu"
+date: "Last updated: 07/13/2020"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      toc_collapsed: true
+      toc_depth: 3
+      code_folding: hide
+      df_print: paged
+number_sections: false
+---
+
+**Objective:** Explore spatial and temporal autocorrelation in trachoma indicators in preparation for model building.
+
+```{r setup, message = FALSE}
+library(here)
+#source(here("..", "0-config.R"))
+
+## required packages & variables from `0-config` file
+if (!require("tidyverse")) install.packages("tidyverse"); library("tidyverse")
+if (!require("ggplot2")) install.packages("ggplot2"); library("ggplot2")
+if (!require("gridExtra")) install.packages("gridExtra"); library("gridExtra")
+if (!require("sf")) install.packages("sf"); library("sf")
+data_path <- "../1-data"
+swift_crs <- 4326
+survey_list <- c(0,12,24,36)
+
+# load(here(data_path, "1-temp", "swift_spatial_data.Rda"))
+clu_random_modeldata <- readRDS("~/Desktop/DATA/aa-anemia/swift_data/clu_random_modeldata.rds")
+clu_random_0to5 <- clu_random_modeldata %>% filter(age_group == "0-5y")
+```
+
+### Spatial: Moran's I
+
+Moran's I measures global spatial autocorrelation (i.e. how similar one point is to others around it). Like a correlation coefficient, Moran's I ranges from -1 to 1. The expected value of Moran's I is slightly negative, approaching zero with increasing sample size. GeoDa (by Luc Anselin, et al.) has a helpful resource on Moran's I [here](https://geodacenter.github.io/workbook/5a_global_auto/lab5a.html). Inference can be conducted under an assumption of normality (shown here) or by permutation. 
+
+```{r moran, fig.width = 8.5}
+get_moran <- function(outcome_var, curr_survey){
+  
+  temp_df <- clu_random_0to5 %>%
+    filter(survey == curr_survey)
+  
+  # distance method below based on code from spatial epi in R: https://hughst.github.io/week-4/
+  # create symmetric matrix of distances between every point
+  # dist_matrix <- temp_df %>%  
+  #   dplyr::select(lon, lat) %>%
+  #   dist() %>% 
+  #   as.matrix() 
+  
+  # updated to distGeo distance method, which accounts for globe surface
+  # gives very similar Moran's I results to dist()
+  temp_spatial <- temp_df %>% 
+    st_as_sf(coords = c("lon", "lat"), crs = swift_crs) %>%
+    as("Spatial")
+  
+  dist_matrix <- sapply(1:nrow(temp_spatial),
+                        function(x) geosphere::distGeo(p1 = temp_spatial, p2 = temp_spatial[x,]))
+  
+  # take inverse of distances
+  dist_matrix_inv <- 1/dist_matrix
+  diag(dist_matrix_inv) <- 0
+  
+  # estimate Moran's I and statistical significance for each trachoma variable 
+  ret <- ape::Moran.I(temp_df %>% pull(outcome_var), dist_matrix_inv) %>% 
+    as.data.frame() %>% 
+    mutate(outcome_var = outcome_var, curr_survey = curr_survey)
+  
+  return(ret)
+}
+
+moran_results <- mapply(get_moran,
+                     outcome_var = rep(c("prevalence_sero", "prevalence_clin", "prevalence_pcr"), each = 4),
+                     curr_survey = rep(survey_list, 3),
+                     SIMPLIFY = FALSE) %>%
+  bind_rows() %>%
+  mutate_at(vars(-c("outcome_var")), as.numeric)
+
+# summarize results in table
+knitr::kable(x = moran_results %>% dplyr::select(outcome_var, curr_survey, observed, p.value),
+  caption = "Global Moran's I by trachoma indicator",
+  col.names = c("trachoma indicator", "survey month", "global Moran's I", "p-value"),
+  digits = 4)
+```
+
+### Spatial: variograms
+
+```{r}
+# create SpatialPointsDataFrame for clusters to allow for variogram building
+clu_spatial <- cluster_sf %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = swift_crs) %>%
+  as("Spatial")
+
+# rule of thumb: limit max distance in variogram to half of maximum interpoint distance
+clu_distances <- sapply(1:nrow(clu_spatial), function(x) geosphere::distGeo(p1 = clu_spatial, p2 = clu_spatial[x,])) # estimate distance from each point to all other points
+max_dist <- max(clu_distances) / 2 / 1000 # divide by 1000 to turn meters to km (33.26 km)
+
+## `get_variogram`: function to estimate variograms, fitted models, and monte carlo envelopes
+# input_df: input dataframe
+# input_formula: formula for variogram estimation
+# input_survey: survey time point to concentrate on
+# input_model: model to fit to variogram
+# return line, fit (sserr), effective range, and empirical values (exp_var) for variograms
+get_variogram <- function(input_df, input_formula, input_survey, input_model = "Exp"){
+  
+  # create temporary spatial dataframe based on inputs
+  temp_spatial <- input_df %>%
+    filter(survey == input_survey) %>% 
+    st_as_sf(coords = c("lon", "lat"), remove = FALSE, crs = swift_crs) %>%
+    as("Spatial")
+    
+  ## get variogram model fits
+  # note that automap creates fewer, but larger bins than gstat (gstat results were much more unstable)
+  # note: `dist` in results is the average distance of all pairs in that bin (see `gstat` documentation)
+  temp_fit <- automap::autofitVariogram(formula = as.formula(input_formula),
+                                        input_data = temp_spatial,
+                                        model = input_model, # ability to fit multiple models at once is deprecated?
+                                        kappa = c(1.5, 2.5, 3.5, 5, 10, 15, 20), # only used for Matern
+                                        # miscFitOptions = list(merge.small.bins = TRUE) # alternative way to create larger bins
+                                        miscFitOptions = list(min.np.bin = 10)) # automap has this feature, gstat does not
+  temp_var_model <- temp_fit$var_model
+  
+  # save values for fitted model
+  temp_line <- gstat::variogramLine(temp_var_model, maxdist = max_dist)
+  variog_line <- temp_line %>% mutate(formula = input_formula, survey = input_survey, model = input_model)
+  
+  # estimate effective range using nugget + 95% of sill
+  temp_sill <- temp_var_model[which(temp_var_model$model == input_model), "psill"]
+  temp_nugget <- temp_var_model[which(temp_var_model$model == "Nug"), "psill"]
+  temp_effrange_y <- temp_sill*0.95 + temp_nugget
+  temp_effrange <- ifelse(max(temp_line$gamma) < temp_effrange_y,
+                          NA,
+                          temp_line$dist[min(which(temp_line$gamma >= temp_effrange_y))])
+  variog_stats <- data.frame(formula = input_formula, survey = input_survey, model = input_model,
+                             sserr = temp_fit$sserr, effrange = temp_effrange)
+  
+  # save values for empirical variogram
+  variog_expvar <- temp_fit$exp_var %>% dplyr::select(np, dist, gamma) %>%
+    mutate(formula = input_formula, survey = input_survey, model = input_model)
+  
+  ret <- list(variog_line = variog_line,
+              variog_stats = variog_stats,
+              variog_expvar = variog_expvar)
+    
+  return(ret)
+}
+
+## `geo_perm`: helper function to conduct permutations
+# input_df: input dataframe
+# input_seed: for replication of permutations
+# return permuted df - fixed lat/lon values, permuted outcomes
+geo_perm <- function(input_df, input_seed){
+  fix_locations <- input_df %>% 
+    dplyr::select(lon, lat)
+  
+  set.seed(input_seed)
+  temp_permute <- input_df %>% 
+    dplyr::select(-c(lon, lat)) %>% 
+    sample_n(size = nrow(.), replace = FALSE)
+  
+  return(bind_cols(fix_locations, temp_permute))
+}
+
+## `get_variog_perms`: function to conduct Monte Carlo variogram permutations
+# input_df: input dataframe
+# input_formula: formula for variogram estimation
+# input_survey: survey time point to concentrate on
+# n_permute: number of permutations, must be >0
+# return empirical values (exp_var) and 95% interval for permutations
+get_variog_perms <- function(input_df, input_formula, input_survey, n_permute){
+  
+  # keep track of seeds; return list for replication
+  rand_seed_list <- sample(1:10000, size = n_permute, replace = TRUE)
+
+  permute_results <- lapply(
+    c(1:n_permute),
+    function(x){
+      rand_seed <- rand_seed_list[x]
+      
+      temp_permute_df <- geo_perm(input_df = input_df %>% filter(survey == input_survey),
+                                  input_seed = rand_seed)
+      
+      temp_permute_variog <- get_variogram(input_df = temp_permute_df,
+                                           input_formula = input_formula,
+                                           input_survey = input_survey)
+      
+      temp_permute_variog$variog_expvar %>% rename(!!paste0("gamma_", x) := gamma)
+      }) %>%
+    reduce(left_join, by = c("np", "dist", "formula", "survey", "model"))
+  
+  # add observed results
+  variog_results <- get_variogram(input_df = input_df %>% filter(survey == input_survey),
+                                  input_formula = input_formula,
+                                  input_survey = input_survey)
+  
+  permute_results <- permute_results %>% 
+    left_join(variog_results$variog_expvar %>% rename(gamma_0 = gamma),
+              by = c("np", "dist", "formula", "survey", "model"))
+
+  # get upper and lower bounds for 95% envelope
+  permute_bounds <- apply(permute_results %>% dplyr::select(starts_with("gamma")), 1, quantile, c(0.025, 0.975)) %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rename(q0.025 = "2.5%", q0.975 = "97.5%") %>% 
+    mutate(fill_flag = "1") # used for creating ggplot legend
+  
+  ret <- list(permute_results = permute_results %>%
+                bind_cols(permute_bounds) %>%
+                dplyr::select(-c(model)), # note that model is not important for permutations, uses only empirical
+              rand_seed_list = rand_seed_list)
+    
+  return(ret)
+}
+```
+
+```{r}
+## iterate through formulas, surveys, and models
+# 200 permutations takes ~1.1 minutes per formula
+# 1000 permutations takes ~6.1 minutes per formula
+n_permute_variog <- 200
+variog_formula_list <- c("prevalence_pcr~1", "prevalence_sero~1", "prevalence_clin~1",
+                         "prevalence_pcr~lat+lon", "prevalence_sero~lat+lon", "prevalence_clin~lat+lon")
+variog_results <- mapply(get_variogram,
+                         input_formula = rep(variog_formula_list, each = 8),
+                         input_survey = rep(rep(survey_list, 2), 6), 
+                         input_model = rep(rep(c("Mat", "Exp"), each = 4), 6),
+                         MoreArgs = list(input_df = clu_random_0to5),
+                         SIMPLIFY = TRUE)
+
+variog_perm_results <- mapply(get_variog_perms,
+                              input_formula = rep(variog_formula_list, each = 4),
+                              input_survey = rep(survey_list, 6),
+                              n_permute = n_permute_variog,
+                              MoreArgs = list(input_df = clu_random_0to5),
+                              SIMPLIFY = TRUE)
+
+variog_line_df <- variog_results[1,] %>% bind_rows()
+variog_stats_df <- variog_results[2,] %>% bind_rows()
+variog_expvar_df <- variog_results[3,] %>% bind_rows()
+variog_perm_results_df <- variog_perm_results[1,] %>% bind_rows()
+```
+
+```{r, fig.width = 8.5, fig.height = 6.5}
+## plot variograms
+variog_colors <- c("Sph" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[7],
+                   "Exp" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[4],
+                   "Mat" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[5])
+
+## `get_variog_plot`: plots variograms across 4 survey time points
+# variog_results
+# permute_results
+# returns figure containing 4 variogram plots, one for each survey point
+get_variog_plot <- function(permute_results, variog_line, variog_stats, variog_expvar, input_title){
+  
+  # initialize container to save plots
+  variog_plot_list <- list()
+  
+  for(s in survey_list){
+    
+    temp_permute <- permute_results %>% filter(survey == s)
+    temp_line <- variog_line %>% filter(survey == s)
+    temp_stats <- variog_stats %>% filter(survey == s)
+    temp_expvar <- variog_expvar %>% filter(survey == s)
+    
+    # create variogram plot of points and each model fit
+    temp_plot <- ggplot() +
+      geom_ribbon(data = temp_permute,
+                  aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+                  alpha = 0.3) +
+      geom_point(data = temp_expvar, aes(x = dist, y = gamma)) + # empirical variog, does not depend on model
+      geom_text(data = temp_expvar, aes(x = dist, y = 0.06*0.95, label = np),
+                size = 2) + # empirical variog, does not depend on model
+      geom_line(data = temp_line, aes(x = dist, y = gamma, color = model)) +
+      geom_vline(data = temp_stats, aes(xintercept = effrange, color = model),
+                 lty = "dashed", show.legend = FALSE) +
+      scale_color_manual(values = variog_colors,
+                         labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+      scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+      labs(x = "Distance (km)",
+           y = "Semivariance",
+           color = "Fitted model",
+           fill = "") +
+      coord_cartesian(x = c(0, max(temp_expvar %>% pull(dist))),
+                      y = c(0, 0.062)) +
+      theme_classic() +
+      theme(title = element_text(size = 10),
+            panel.grid.major = element_line(color = "grey95"),
+            legend.position = "none") +
+      guides(fill  = guide_legend(order = 2),
+             color = guide_legend(order = 1))
+    
+    if(s != 0){
+      temp_plot <- temp_plot +
+        theme(axis.title.y = element_blank(),
+              axis.text.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.line.y = element_blank())
+    }
+    
+    if(s == 0){
+      temp_plot <- temp_plot +
+        geom_text(aes(x = 8, y = 0.062), label = "Bin sample sizes", size = 3) +
+        theme(plot.margin = unit(c(0.3,0,0.3,1), 'lines'))
+    }
+    
+    if(s == 36){
+      temp_plot <- temp_plot + 
+        theme(legend.position = "right",
+              legend.title = element_text(size = 10),
+              legend.text = element_text(size = 8))
+    }
+  
+    variog_plot_list <- c(variog_plot_list, list(temp_plot))
+  }
+  
+  variog_plot <- arrangeGrob(grobs = variog_plot_list, nrow = 1, widths = c(1.2,1,1,1.6),
+                             top = input_title)
+  return(variog_plot)
+}
+
+variog_plots <- lapply(c("prevalence_pcr~1", "prevalence_sero~1", "prevalence_clin~1"),
+                       function(x){
+                         get_variog_plot(
+                           permute_results = variog_perm_results_df %>% filter(formula == x),
+                           variog_expvar = variog_expvar_df %>% filter(formula == x),
+                           variog_line = variog_line_df %>% filter(formula == x),
+                           variog_stats = variog_stats_df %>% filter(formula == x),
+                           input_title = paste0("Variograms by study month: ", x)
+                          )})
+
+do.call(grid.arrange, args = c(variog_plots, ncol = 1))
+```
+
+### Spatial: variograms after residualizing
+
+Calculation of the variogram depends on the assumption that the data does not have systematic surface trends (stationarity). Although it is generally difficult to distinguish between trends and autocorrelation (see example [here](https://pro.arcgis.com/en/pro-app/latest/help/analysis/geostatistical-analyst/understanding-how-to-remove-trends-from-the-data.htm)), it is typical to check for strong trends with a simple model. Here we detrend by latitude and longitude with a simple linear model; variograms are fairly similar to the non-residualized version above, indicating that there is not a strong east-west or north-south trend in this data. [SAS documentation](https://support.sas.com/documentation/onlinedoc/stat/142/variogram.pdf) p.10077-8 may also be helpful.
+
+```{r, fig.width = 8.5, fig.height = 6.5}
+variog_plots_resid <- lapply(c("prevalence_pcr~lat+lon", "prevalence_sero~lat+lon", "prevalence_clin~lat+lon"),
+                             function(x){
+                               get_variog_plot(
+                                 permute_results = variog_perm_results_df %>% filter(formula == x),
+                                 variog_expvar = variog_expvar_df %>% filter(formula == x),
+                                 variog_line = variog_line_df %>% filter(formula == x),
+                                 variog_stats = variog_stats_df %>% filter(formula == x),
+                                 input_title = paste0("Variograms by study month: ", x)
+                                )})
+
+do.call(grid.arrange, args = c(variog_plots_resid, ncol = 1))
+```
+
+### Temporal: ACF and PACF
+
+We can visualize temporal autocorrelation using the ACF and PACF. The ACF, or autocorrelation function, describes how values in a time series are related to earlier values. The PACF, or partial autocorrelation function, estimates the autocorrelation after removing effects explained by earlier lags ('residuals').
+
+Followed procedure described in this [blog](https://aosmith.rbind.io/2018/06/27/uneven-grouped-autocorrelation/) to pad dataset between groups (clusters) in order to use the acf function below. Note that the autocorrelation function is not the same as correlation between time points (e.g. as calculated for Figure 3 in prediction paper). The autocorrelation function assumes stationarity (shared mean and variance between value at time X and X+t). Since our trachoma indicators are generally increasing with time, negative autocorrelation occurs at longer lags because earlier values tend to be below the mean of the series and later values tend to be above the mean of the series. Some helpful posts [here](https://www.alanzucconi.com/2016/06/06/autocorrelation-function/) and [here](https://stats.stackexchange.com/questions/81754/understanding-this-acf-output).
+
+As with variograms above, repeating this exercise using residuals would help understand how a temporal covariance structure might improve our prediction models. 
+
+```{r, message = FALSE, fig.width = 8.5, fig.height = 7}
+if (!require("forecast")) install.packages("forecast"); library("forecast") # cannot load in config; masks something that `automap` requires
+acf_lag_max <- 3
+
+clu_random_0to5_arranged <- clu_random_0to5 %>%
+  arrange(cluster_id, survey) %>%
+  group_by(cluster_id) %>%
+  # add zeros in between clusters
+  complete(survey = seq(0, 84, by = 12)) %>%
+  ungroup()
+
+acf_grid <- data.frame(var = rep(c("prevalence_pcr", "prevalence_clin", "prevalence_sero"), each = 2),
+                       func = rep(c("ggAcf", "ggPacf"), 3))
+
+acf_plot_list <- lapply(
+  split(acf_grid, 1:nrow(acf_grid)),
+  function(x){
+    do.call(x$func,
+            args = list(x = clu_random_0to5_arranged %>% pull(x$var),
+                        lag.max = acf_lag_max,
+                        na.action = na.pass)) +
+      ggtitle(paste0(x$func, ": ", x$var))})
+
+do.call(grid.arrange, args = c(acf_plot_list, ncol = 2))
+```
