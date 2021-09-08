@@ -39,10 +39,16 @@ data
 # household level
 # not sure if this will work statistically given each household has a very small N but will give it a shot later if I have the time
 data.hhs <- read_dta("anemia_alto_amazonas_abril.dta") %>%
-  select(unique_id:hh_numb, pplinhh:gps_alt, dbs_hg, dbs_hg_na, anemia, anemia_level_sa, anemia_orig) %>%
-  dplyr::rename(anemia.f=anemia_orig) %>%
-  group_by(hh_numb) %>%
-  summarise(n_tested=sum(!is.na(age)),
+  select(unique_id:hh_numb, pplinhh:gps_alt, dbs_hg, dbs_hg_na, anemia, anemia_level_sa, anemia_orig, unique_id) %>%
+  select(-age_cat, -anemia, -anemia_level_sa) %>%
+  dplyr::rename(anemia.f=anemia_orig) %>% ungroup() %>%
+  # grouping the few households with the same GPS coordinates together
+  mutate(hh_numb=case_when(hh_numb %in% c("H-2512384","H-2512385","H-2512387")~"H-2512384",
+                           TRUE ~ hh_numb)) %>%
+  group_by(hh_numb, community) %>%
+  summarise(# village=community,
+            n_ppl=sum(!is.na(unique_id)),
+            n_tested=sum(!is.na(age)),
             n_any_anemia=sum(anemia.f %in% c("mild","moderate","severe")),
             n_mild=sum(anemia.f=="mild"),
             # grouping moderate and severe together due to the low number of severe cases
@@ -52,13 +58,56 @@ data.hhs <- read_dta("anemia_alto_amazonas_abril.dta") %>%
             p_modsev=n_modsev/n_tested,
             # going for medians to get village midpoint as often there were a few houses located very far away
             lat=median(gps_lat, na.rm = T),
-            lon=median(gps_long, na.rm = T))
+            lon=median(gps_long, na.rm = T)) %>%
+  # filtering out missing gps values
+  filter(!is.na(lat) & !is.na(lon))
 data.hhs
 
+# checking for duplicates
+data.hhs %>% mutate(dups=n()) %>% filter(dups>1) # no duplicates
+
+#### checking with other data ####
+ts <- read_csv("loretodata_swabs.csv", guess_max = 3000) %>%
+  select(unique.id, community, age, sex, hh_numb, gps_lat:gps_long, dbs.int.key, dbs.filtercode, dbs.hg, trach.int.key, trach.refused, census,
+         dbs.notes) %>%
+  mutate(census=if_else(census==1&is.na(trach.int.key),1,0), # xtabs(data=loreto.data,~census+is.na(trach.int.key),addNA=T)
+         refused.exam=if_else(is.na(trach.int.key) | trach.refused==1,1,0)) %>% # xtabs(data=loreto.data,~refused.exam+is.na(trach.int.key),addNA=T)
+         filter(census==0) %>% 
+  filter(hh_numb!="control") %>%
+  mutate(dbs.hg.na=ifelse(dbs.hg == -999999999, NA_real_, dbs.hg),
+         hemocue=case_when(grepl("hemocue",dbs.notes)~1, # we had hemocue malfunctions in these communities, sometimes we got it to work and other times we did not
+                             is.na(dbs.hg.na) & !is.na(dbs.int.key) & community %in% c("Corazon de Jesus","Nuevo Barranquita","Loma Linda","Maranatha")~1,
+                             TRUE ~ 0), # addmargins(xtabs(data=anemia,~hemocue+!is.na(dbs.hg.na),addNA=T))
+         coag=if_else(grepl("coag",dbs.notes),1,0), # xtabs(data=anemia,~coag,addNA=T)
+         refused=if_else(is.na(dbs.int.key),1,0), # addmargins(xtabs(data=anemia,~refused+!is.na(dbs.hg.na),addNA=T))
+         missing=if_else(hemocue==0&coag==0&refused==0&is.na(dbs.hg.na),1,0), # addmargins(xtabs(data=anemia,~missing+!is.na(dbs.hg.na),addNA=T))
+         # creating a variable with all individuals identified above
+         exclude=if_else(hemocue==1 | coag==1 | refused==1 | missing==1, 1, 0)) %>% # addmargins(xtabs(data=anemia,~exclude+!is.na(dbs.hg.na),addNA=T))
+  # now I am filtering out points to get the current anemia dataset
+  filter(age>=1 & age<10) %>%
+  filter(exclude==0)
+
+ts %>% group_by(community, hh_numb) %>% 
+  summarise(n_ppl=sum(!is.na(unique.id)),
+            n_tested=sum(!is.na(age)),
+            #n_any_anemia=sum(anemia.f %in% c("mild","moderate","severe")),
+            #n_mild=sum(anemia.f=="mild"),
+            # grouping moderate and severe together due to the low number of severe cases
+            #n_modsev=sum(anemia.f %in% c("moderate","severe")),
+            #p_any=n_any_anemia/n_tested,
+            #p_mild=n_mild/n_tested,
+            #p_modsev=n_modsev/n_tested,
+            # going for medians to get village midpoint as often there were a few houses located very far away
+            lat=median(gps_lat, na.rm = T),
+            lon=median(gps_long, na.rm = T)) %>%
+  view(.)
+
+
+
 #### descriptive code ####
-ggplot(data, aes(x=p_any)) + geom_histogram()
-ggplot(data, aes(x=p_mild)) + geom_histogram()
-ggplot(data, aes(x=p_modsev)) + geom_histogram() # none of these look normally distributed
+ggplot(data, aes(x=p_any)) + geom_histogram(bins=15)
+ggplot(data, aes(x=p_mild)) + geom_histogram(bins=15)
+ggplot(data, aes(x=p_modsev)) + geom_histogram(bins=15) # none of these look normally distributed
 
 #### global morans I ####
 # all code below is based off that provided by JK
@@ -84,7 +133,9 @@ ape::Moran.I(data$p_mild, dist_matrix_inv) %>% as_tibble(.)
 ape::Moran.I(data$p_modsev, dist_matrix_inv) %>% as_tibble(.) # none are significant likely due to the small sample size
 
 
+
 #### semi-variograms ####
+
 # create a spatial points dataframe to allow for variogram building
 data_spatial
 
@@ -104,7 +155,7 @@ get_variogram <- function(input_df, input_formula, input_model = "Exp"){
   
   # create temporary spatial dataframe based on inputs
   temp_spatial <- input_df %>%
-    st_as_sf(coords = c("lon", "lat"), remove = FALSE, crs = swift_crs) %>%
+    st_as_sf(coords = c("lon", "lat"), remove = FALSE, crs = crs) %>%
     as("Spatial")
   
   ## get variogram model fits
@@ -228,15 +279,343 @@ variog_perm_results <- mapply(get_variog_perms,
                               MoreArgs = list(input_df = data),
                               SIMPLIFY = TRUE)
 
-variog_line_df <- variog_results[1,] %>% bind_rows()
-variog_stats_df <- variog_results[2,] %>% bind_rows()
-variog_expvar_df <- variog_results[3,] %>% bind_rows()
-variog_perm_results_df <- variog_perm_results[1,] %>% bind_rows()
+variog_line_df <- variog_results[1,] %>% bind_rows() # class(variog_line_df)
+variog_stats_df <- variog_results[2,] %>% bind_rows() # class(variog_stats_df)
+variog_expvar_df <- variog_results[3,] %>% bind_rows() # class(variog_expvar_df)
+variog_perm_results_df <- variog_perm_results[1,] %>% bind_rows() # class(variog_perm_results_df)
 
 ## plot variograms
+# setting colors
 variog_colors <- c("Sph" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[7],
                    "Exp" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[4],
                    "Mat" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[5])
+# any anemia
+plot_any <- ggplot() +
+  geom_ribbon(data = variog_perm_results_df %>% filter(formula == "p_any~1"), # originally temp_permute
+              aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+              alpha = 0.3) +
+  geom_point(data = variog_expvar_df %>% filter(formula == "p_any~1"), aes(x = dist, y = gamma)) + # replaced temp_expvar with variog_expvar_df
+  geom_text(data = variog_expvar_df %>% filter(formula == "p_any~1"), aes(x = dist, y = 0.06*0.95, label = np),
+            size = 2) + # empirical variog, does not depend on model
+  geom_line(data = variog_line_df %>% filter(formula == "p_any~1"), aes(x = dist, y = gamma, color = model)) +
+  geom_vline(data = variog_stats_df %>% filter(formula == "p_any~1"), aes(xintercept = effrange, color = model),
+             lty = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = variog_colors,
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+  scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+  labs(x = "Distance (km)",
+       y = "Semivariance",
+       color = "Fitted model",
+       fill = "") +
+  coord_cartesian(x = c(0, max((variog_expvar_df%>% filter(formula == "p_any~1")) %>% pull(dist))),
+                  y = c(0, 0.062)) +
+  theme_classic() +
+  theme(title = element_text(size = 10),
+        panel.grid.major = element_line(color = "grey95"),
+        ) + # legend.position = "none"
+  guides(fill  = guide_legend(order = 2),
+         color = guide_legend(order = 1))
+plot_any
+
+# mild anemia
+plot_mild <- ggplot() +
+  geom_ribbon(data = variog_perm_results_df %>% filter(formula == "p_mild~1"), # originally temp_permute
+              aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+              alpha = 0.3) +
+  geom_point(data = variog_expvar_df %>% filter(formula == "p_mild~1"), aes(x = dist, y = gamma)) + # replaced temp_expvar with variog_expvar_df
+  geom_text(data = variog_expvar_df %>% filter(formula == "p_mild~1"), aes(x = dist, y = 0.06*0.95, label = np),
+            size = 2) + # empirical variog, does not depend on model
+  geom_line(data = variog_line_df %>% filter(formula == "p_mild~1"), aes(x = dist, y = gamma, color = model)) +
+  geom_vline(data = variog_stats_df %>% filter(formula == "p_mild~1"), aes(xintercept = effrange, color = model),
+             lty = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = variog_colors,
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+  scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+  labs(x = "Distance (km)",
+       y = "Semivariance",
+       color = "Fitted model",
+       fill = "") +
+  coord_cartesian(x = c(0, max((variog_expvar_df%>% filter(formula == "p_mild~1")) %>% pull(dist))),
+                  y = c(0, 0.062)) +
+  theme_classic() +
+  theme(title = element_text(size = 10),
+        panel.grid.major = element_line(color = "grey95"),
+        ) + # legend.position = "none"
+  guides(fill  = guide_legend(order = 2),
+         color = guide_legend(order = 1))
+plot_mild 
+
+# moderate to severe anemia
+plot_modsev <- ggplot() +
+  geom_ribbon(data = variog_perm_results_df %>% filter(formula == "p_modsev~1"), # originally temp_permute
+              aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+              alpha = 0.3) +
+  geom_point(data = variog_expvar_df %>% filter(formula == "p_modsev~1"), aes(x = dist, y = gamma)) + # replaced temp_expvar with variog_expvar_df
+  geom_text(data = variog_expvar_df %>% filter(formula == "p_modsev~1"), aes(x = dist, y = 0.06*0.95, label = np),
+            size = 2) + # empirical variog, does not depend on model
+  geom_line(data = variog_line_df %>% filter(formula == "p_modsev~1"), aes(x = dist, y = gamma, color = model)) +
+  geom_vline(data = variog_stats_df %>% filter(formula == "p_modsev~1"), aes(xintercept = effrange, color = model),
+             lty = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = variog_colors,
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+  scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+  labs(x = "Distance (km)",
+       y = "Semivariance",
+       color = "Fitted model",
+       fill = "") +
+  coord_cartesian(x = c(0, max((variog_expvar_df%>% filter(formula == "p_modsev~1")) %>% pull(dist))),
+                  y = c(0, 0.062)) +
+  theme_classic() +
+  theme(title = element_text(size = 10),
+        panel.grid.major = element_line(color = "grey95"),
+        ) + # legend.position = "none"
+  guides(fill  = guide_legend(order = 2),
+         color = guide_legend(order = 1))
+plot_modsev
+
+# putting them all together
+semivar_plots <- ggpubr::ggarrange(plot_any, plot_mild, plot_modsev,
+                                   nrow = 1, common.legend = T, legend = "right")
+semivar_plots
+
+#### repeating Moran's I at village level ####
+# not sure if this will work as the prevalence estimates in the houses will be crude (ie 0, 0.5, or 1 given the low n in each household)
+
+# converting my data to SF
+data_spatial.hhs <- data.hhs %>% 
+  # just applying this to one village
+  filter(community=="Panam") %>%
+  st_as_sf(coords = c("lon","lat"), crs = crs) %>%
+  as("Spatial")
+
+# create symmetric matrix of distances between every point
+dist_matrix.hhs <- sapply(1:nrow(data_spatial.hhs),
+                      # using the distGeo method accounts for globe curvature when calculating distance
+                      function(x) geosphere::distGeo(p1 = data_spatial.hhs, p2 = data_spatial.hhs[x,]))
+
+# take inverse of distance 
+dist_matrix_inv.hhs <- 1/dist_matrix.hhs # due to duplicates with 0 distance between them this is leading to 1/0 = Inf
+# replace the Inf values in the diagonals with 0
+diag(dist_matrix_inv.hhs) <- 0
+
+# estimate moran's I and statistical significance for each level of anemia
+ape::Moran.I(filter(data.hhs, community=="Panam")$p_any, dist_matrix_inv.hhs) %>% as_tibble(.)
+ape::Moran.I(filter(data.hhs, community=="Panam")$p_mild, dist_matrix_inv.hhs) %>% as_tibble(.)
+ape::Moran.I(filter(data.hhs, community=="Panam")$p_modsev, dist_matrix_inv.hhs) %>% as_tibble(.) # none are significant likely due to the small sample size
+
+# it works for one village, now I have to create a function that will apply it to all 21
+village.moran <- function(outcome_var, village) {
+  
+  # 1. create a df for just the village
+  temp_df <- data.hhs %>%
+    filter(community == village)
+  
+  # 2. convert to spatial format
+  temp_df_spatial <- temp_df %>% 
+    st_as_sf(coords = c("lon","lat"), crs = crs) %>%
+    as("Spatial")
+  
+  # 2. create symmetric matrix of distances between every point
+  dist_matrix <- sapply(1:nrow(temp_df_spatial),
+                            function(x) geosphere::distGeo(p1 = temp_df_spatial, p2 = temp_df_spatial[x,]))
+  
+  # 3. take inverse of distance
+  dist_matrix_inv <- 1/dist_matrix
+  
+  # 4. replace the Inf values with 0 
+  diag(dist_matrix_inv) <- 0
+  
+  # 5. estimate Moran's I and p-value for each level of anemia
+  ret <- ape::Moran.I(temp_df %>% pull(outcome_var), dist_matrix_inv) %>% 
+    as_tibble() %>% 
+    mutate(outcome_var = outcome_var, village = village) %>%
+    select(village, outcome_var, observed, expected, p.value)
+  
+  # 6. bind all of these together
+  # ret <- rbind(any, mild, mod) %>% select(village, level, observed, expected, p.value)
+  
+  # 6. return the results
+  return(ret)
+  
+}
+
+village.moran("p_any", "Panam") # Works!
+
+village_list <- data.hhs %>% 
+  # filtering out these two since there are only two households with anemia/gps data and this is not enough for morans I
+  filter(!(community %in% c("Nuevo Barranquita","Corazon de Jesus"))) %>%
+  ungroup() %>%
+  # getting a unique list of the remaining village
+  distinct(.$community) %>% as.vector()
+village_list
+
+
+#### now to iterate it over every village ####
+moran.village <- mapply(village.moran,
+                        outcome_var = rep(c("p_any", "p_mild", "p_modsev"), each = 19),
+                        village = village_list,
+                        SIMPLIFY = F)
+
+nuevo_arica <- mapply(village.moran,
+       outcome_var = c("p_any", "p_mild", "p_modsev"),
+       village = "Nuevo Arica",
+       SIMPLIFY = F) %>%
+  bind_rows()
+
+dos_mayo <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Dos de Mayo",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+bellavista_b <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Bellavista (Balsapuerto)",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_papaplaya <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Nuevo Papaplaya",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_barranquita <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Nuevo Barranquita",
+                      SIMPLIFY = F) %>%
+  bind_rows() # duplicate error, simply two households so not enough data for Moran's I
+
+corazon_de_jesus <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village ="Corazon de Jesus",
+                      SIMPLIFY = F) %>%
+  bind_rows() # duplicate error
+
+bethel <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Bethel",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+bellavista_j <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Bellavista (Jeberos)",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+vista_allegre <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Vista Allegre",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+huancayo <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Huancayo",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_arica <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Nuevo Arica",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+sies_julio <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "06 de Julio",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+tamarate <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Tamarate",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+huatapi <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Huatapi",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+union_campesino <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Union Campesino",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_iquitos <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Nuevo Iquitos",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+angamos <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Angamos",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+san_antonio <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "San Antonio",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+panam <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Panam",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+maranatha <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Maranatha",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+loma_linda <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Loma Linda",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+centro_america <- mapply(village.moran,
+                     outcome_var = c("p_any", "p_mild", "p_modsev"),
+                     village = "Centro America",
+                     SIMPLIFY = F) %>%
+  bind_rows() # duplicate error?
+
+village.morans <- rbind(centro_america, loma_linda, maranatha, panam, san_antonio, angamos, 
+                        nuevo_iquitos, union_campesino, huatapi, tamarate, sies_julio, nuevo_arica, 
+                        huancayo, vista_allegre, bellavista_j, bethel, nuevo_papaplaya, bellavista_b, 
+                        dos_mayo, nuevo_arica)
+village.morans
+
+ggplot(village.morans, aes(x=observed)) + 
+  geom_histogram(bins = 20) + 
+  facet_grid(~outcome_var)
+
+village.morans %>%
+  group_by(outcome_var) %>%
+  summarise(mean=mean(observed),
+            sd=sd(observed))
+  
+
+#### question: to repeat semivariograms at village level ####
+# https://link.springer.com/chapter/10.1007/978-94-011-1739-5_14
+  # according to this you need about 50 data points to make the semivariogram worthwhile
+  # and my class notes recommend >50 points in total and each bin (group of points of similar distances apart) should have ≥30 pairwise comparisons
+  # lastly the data needs to be normally distributed, otherwise it needs to be transformed.
+
+
+
+
+
+
+
 
 ## `get_variog_plot`: plots variograms across 4 survey time points
 # variog_results
@@ -345,3 +724,51 @@ variog_plots <- lapply(c("p_any~1", "p_mild~1", "p_modsev~1"),
 #   mutate(weight=value/11599)
 # # creating the weights
 # weights19 <- AAcensus %>% filter(age.group19!="total") %>% mutate(age.group19=as.numeric(age.group19))
+# # trying to open a different dataset
+# data.hhs2 <- read_csv("loretodata_swabs.csv", guess_max = 3000) %>% 
+#   select(district:unique.id, dbs.hg, gps_lat:gps_long, census, trach.int.key, trach.refused, dbs.notes,
+#          dbs.int.key) %>%
+#   # applying the same selection criteria for the data that I sent to Jorge
+#   mutate(census=if_else(census==1&is.na(trach.int.key),1,0), # xtabs(data=loreto.data,~census+is.na(trach.int.key),addNA=T)
+#          refused.exam=if_else(is.na(trach.int.key) | trach.refused==1,1,0),
+#          dbs.hg.na=if_else(dbs.hg == -999999999, NA_real_, dbs.hg)) %>% # xtabs(data=loreto.data,~refused.exam+is.na(trach.int.key),addNA=T)
+#   # view(loreto.data %>% filter(refused.exam==1&!is.na(trach.int.key)))
+#   mutate(hemocue=case_when(grepl("hemocue",dbs.notes)~1, # we had hemocue malfunctions in these communities, sometimes we got it to work and other times we did not
+#                            is.na(dbs.hg.na) & !is.na(dbs.int.key) & community %in% c("Corazon de Jesus","Nuevo Barranquita","Loma Linda","Maranatha")~1,
+#                            TRUE ~ 0), # addmargins(xtabs(data=anemia,~hemocue+!is.na(dbs.hg.na),addNA=T))
+#          coag=if_else(grepl("coag",dbs.notes),1,0), # xtabs(data=anemia,~coag,addNA=T)
+#          refused=if_else(is.na(dbs.int.key),1,0), # addmargins(xtabs(data=anemia,~refused+!is.na(dbs.hg.na),addNA=T))
+#          missing=if_else(hemocue==0&coag==0&refused==0&is.na(dbs.hg.na),1,0), # addmargins(xtabs(data=anemia,~missing+!is.na(dbs.hg.na),addNA=T))
+#          # creating a variable with all individuals identified above
+#          exclude=if_else(hemocue==1 | coag==1 | refused==1 | missing==1, 1, 0))
+# 
+# 
+# data.hhs2 %>% group_by(hh_numb, community) %>% 
+#   # applying same selection criteria as those for the original data I sent to jorge
+#   filter(census==0) %>% filter(hh_numb!="control") %>%
+#   filter(exclude==0) %>% filter(age<10) %>% filter(age>=1) %>% 
+#   summarise( # village=community,
+#     n_ppl=sum(!is.na(unique.id)),
+#     n_tested=sum(!is.na(age)),
+#     # n_any_anemia=sum(anemia.f %in% c("mild","moderate","severe")),
+#     # n_mild=sum(anemia.f=="mild"),
+#     # grouping moderate and severe together due to the low number of severe cases
+#     # n_modsev=sum(anemia.f %in% c("moderate","severe")),
+#     # p_any=n_any_anemia/n_tested,
+#     # p_mild=n_mild/n_tested,
+#     # p_modsev=n_modsev/n_tested,
+#     # going for medians to get village midpoint as often there were a few houses located very far away
+#     lat=median(gps_lat, na.rm = T),
+#     lon=median(gps_long, na.rm = T)) %>%
+#   # filtering out missing gps values
+#   filter(!is.na(lat) & !is.na(lon))
+# 
+# 
+# 
+# summarise(n=sum(!is.na(unique.id))) %>%
+#   group_by(hh_numb) %>%
+#   mutate(dups=n()) %>% filter(dups>1) # no dups when I do it this way
+# 
+# data.hhs2 %>% group_by(hh_numb) %>%
+#   mutate(dups=n()) %>% filter(dups>1) # plenty of duplicates here....
+

@@ -89,7 +89,7 @@ knitr::kable(x = moran_results %>% dplyr::select(outcome_var, curr_survey, obser
 
 ```{r}
 # create SpatialPointsDataFrame for clusters to allow for variogram building
-clu_spatial <- cluster_sf %>% 
+clu_spatial <- clu_random_0to5 %>% 
   st_as_sf(coords = c("lon", "lat"), crs = swift_crs) %>%
   as("Spatial")
 
