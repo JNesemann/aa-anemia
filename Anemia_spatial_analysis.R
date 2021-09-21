@@ -7,6 +7,7 @@ library(haven)
 library(foreign)
 library(sf)
 library(gridExtra)
+library(here)
 
 #### configurations and obects of constant value ####
 options(scipen = 999)
@@ -60,7 +61,8 @@ data.hhs <- read_dta("anemia_alto_amazonas_abril.dta") %>%
             lat=median(gps_lat, na.rm = T),
             lon=median(gps_long, na.rm = T)) %>%
   # filtering out missing gps values
-  filter(!is.na(lat) & !is.na(lon))
+  filter(!is.na(lat) & !is.na(lon)) %>%
+  ungroup()
 data.hhs
 
 # checking for duplicates
@@ -99,10 +101,7 @@ ts %>% group_by(community, hh_numb) %>%
             #p_modsev=n_modsev/n_tested,
             # going for medians to get village midpoint as often there were a few houses located very far away
             lat=median(gps_lat, na.rm = T),
-            lon=median(gps_long, na.rm = T)) %>%
-  view(.)
-
-
+            lon=median(gps_long, na.rm = T))
 
 #### descriptive code ####
 ggplot(data, aes(x=p_any)) + geom_histogram(bins=15)
@@ -132,16 +131,16 @@ ape::Moran.I(data$p_any, dist_matrix_inv) %>% as_tibble(.)
 ape::Moran.I(data$p_mild, dist_matrix_inv) %>% as_tibble(.)
 ape::Moran.I(data$p_modsev, dist_matrix_inv) %>% as_tibble(.) # none are significant likely due to the small sample size
 
-
-
 #### semi-variograms ####
 
 # create a spatial points dataframe to allow for variogram building
-data_spatial
+hhs_spatial <- data.hhs %>%
+  st_as_sf(coords = c("lon","lat"), crs = crs) %>%
+  as("Spatial")
 
 # rule of thumb: limit max distance to hald of max interpoint distance
 # estimate distance from each point to all other points
-clu_distances <- sapply(1:nrow(data_spatial), function(x) geosphere::distGeo(p1 = data_spatial, p2 = data_spatial[x,]))
+clu_distances <- sapply(1:nrow(hhs_spatial), function(x) geosphere::distGeo(p1 = hhs_spatial, p2 = hhs_spatial[x,]))
 # divide by 1000 to turn meters into KM
 max_dist <- max(clu_distances) / 2 / 1000
   
@@ -166,7 +165,7 @@ get_variogram <- function(input_df, input_formula, input_model = "Exp"){
                                         model = input_model, # ability to fit multiple models at once is deprecated?
                                         kappa = c(1.5, 2.5, 3.5, 5, 10, 15, 20), # only used for Matern
                                         # miscFitOptions = list(merge.small.bins = TRUE) # alternative way to create larger bins
-                                        miscFitOptions = list(min.np.bin = 10)) # automap has this feature, gstat does not
+                                        miscFitOptions = list(min.np.bin = 10)) # automap has this feature, gstat does not 
   temp_var_model <- temp_fit$var_model
   
   # save values for fitted model
@@ -286,8 +285,7 @@ variog_perm_results_df <- variog_perm_results[1,] %>% bind_rows() # class(variog
 
 ## plot variograms
 # setting colors
-variog_colors <- c("Sph" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[7],
-                   "Exp" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[4],
+variog_colors <- c("Exp" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[4],
                    "Mat" = RColorBrewer::brewer.pal(n = 8, name = "Dark2")[5])
 # any anemia
 plot_any <- ggplot() +
@@ -301,7 +299,7 @@ plot_any <- ggplot() +
   geom_vline(data = variog_stats_df %>% filter(formula == "p_any~1"), aes(xintercept = effrange, color = model),
              lty = "dashed", show.legend = FALSE) +
   scale_color_manual(values = variog_colors,
-                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern")) +
   scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
   labs(x = "Distance (km)",
        y = "Semivariance",
@@ -329,7 +327,7 @@ plot_mild <- ggplot() +
   geom_vline(data = variog_stats_df %>% filter(formula == "p_mild~1"), aes(xintercept = effrange, color = model),
              lty = "dashed", show.legend = FALSE) +
   scale_color_manual(values = variog_colors,
-                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern")) +
   scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
   labs(x = "Distance (km)",
        y = "Semivariance",
@@ -357,7 +355,7 @@ plot_modsev <- ggplot() +
   geom_vline(data = variog_stats_df %>% filter(formula == "p_modsev~1"), aes(xintercept = effrange, color = model),
              lty = "dashed", show.legend = FALSE) +
   scale_color_manual(values = variog_colors,
-                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern")) +
   scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
   labs(x = "Distance (km)",
        y = "Semivariance",
@@ -377,6 +375,126 @@ plot_modsev
 semivar_plots <- ggpubr::ggarrange(plot_any, plot_mild, plot_modsev,
                                    nrow = 1, common.legend = T, legend = "right")
 semivar_plots
+
+# saving
+setwd("~/Library/Mobile Documents/com~apple~CloudDocs/R projects/aa-anemia")
+ggsave("figures/village_semivariogram.pdf", semivar_plots)
+
+#### repeating semivariogram at the hh level ####
+n_permute_variog <- 200
+
+variog_results.hhs <- mapply(get_variogram,
+                         input_formula = rep(variog_formula_list, each = 8),
+                         # input_survey = rep(rep(survey_list, 2), 6), 
+                         input_model = rep(rep(c("Mat", "Exp"), each = 4), 6),
+                         MoreArgs = list(input_df = data.hhs),
+                         SIMPLIFY = TRUE)
+
+variog_perm_results.hhs <- mapply(get_variog_perms,
+                              input_formula = rep(variog_formula_list, each = 4),
+                              # input_survey = rep(survey_list, 6),
+                              n_permute = n_permute_variog,
+                              MoreArgs = list(input_df = data.hhs),
+                              SIMPLIFY = TRUE)
+
+variog_linehhs_df <- variog_results.hhs[1,] %>% bind_rows() # class(variog_line_df)
+variog_statshhs_df <- variog_results.hhs[2,] %>% bind_rows() # class(variog_stats_df)
+variog_expvarhhs_df <- variog_results.hhs[3,] %>% bind_rows() # class(variog_expvar_df)
+variog_perm_resultshhs_df <- variog_perm_results.hhs[1,] %>% bind_rows() # class(variog_perm_results_df)
+
+## plot variograms
+
+# any anemia
+plot_any.hh <- ggplot() +
+  geom_ribbon(data = variog_perm_resultshhs_df %>% filter(formula == "p_any~1"), # originally temp_permute
+              aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+              alpha = 0.3) +
+  geom_point(data = variog_expvarhhs_df %>% filter(formula == "p_any~1"), aes(x = dist, y = gamma)) + # replaced temp_expvar with variog_expvar_df
+  geom_text(data = variog_expvarhhs_df %>% filter(formula == "p_any~1"), aes(x = dist, y = 0.06*0.95, label = np),
+            size = 2) + # empirical variog, does not depend on model
+  geom_line(data = variog_linehhs_df %>% filter(formula == "p_any~1"), aes(x = dist, y = gamma, color = model)) +
+  geom_vline(data = variog_statshhs_df %>% filter(formula == "p_any~1"), aes(xintercept = effrange, color = model),
+             lty = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = variog_colors,
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+  scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+  labs(x = "Distance (km)",
+       y = "Semivariance",
+       color = "Fitted model",
+       fill = "") +
+  coord_cartesian(x = c(0, max((variog_expvarhhs_df%>% filter(formula == "p_any~1")) %>% pull(dist))),
+                  y = c(0, 0.25)) +
+  theme_classic() +
+  theme(title = element_text(size = 10),
+        panel.grid.major = element_line(color = "grey95"),
+  ) + # legend.position = "none"
+  guides(fill  = guide_legend(order = 2),
+         color = guide_legend(order = 1))
+plot_any.hh
+
+# mild anemia
+plot_mild.hh <- ggplot() +
+  geom_ribbon(data = variog_perm_resultshhs_df %>% filter(formula == "p_mild~1"), # originally temp_permute
+              aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+              alpha = 0.3) +
+  geom_point(data = variog_expvarhhs_df %>% filter(formula == "p_mild~1"), aes(x = dist, y = gamma)) + # replaced temp_expvar with variog_expvar_df
+  geom_text(data = variog_expvarhhs_df %>% filter(formula == "p_mild~1"), aes(x = dist, y = 0.06*0.95, label = np),
+            size = 2) + # empirical variog, does not depend on model
+  geom_line(data = variog_linehhs_df %>% filter(formula == "p_mild~1"), aes(x = dist, y = gamma, color = model)) +
+  geom_vline(data = variog_statshhs_df %>% filter(formula == "p_mild~1"), aes(xintercept = effrange, color = model),
+             lty = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = variog_colors,
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+  scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+  labs(x = "Distance (km)",
+       y = "Semivariance",
+       color = "Fitted model",
+       fill = "") +
+  coord_cartesian(x = c(0, max((variog_expvarhhs_df%>% filter(formula == "p_mild~1")) %>% pull(dist))),
+                  y = c(0, 0.25)) +
+  theme_classic() +
+  theme(title = element_text(size = 10),
+        panel.grid.major = element_line(color = "grey95"),
+  ) + # legend.position = "none"
+  guides(fill  = guide_legend(order = 2),
+         color = guide_legend(order = 1))
+plot_mild.hh
+
+# moderate to severe anemia
+plot_modsev.hh <- ggplot() +
+  geom_ribbon(data = variog_perm_resultshhs_df %>% filter(formula == "p_modsev~1"), # originally temp_permute
+              aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
+              alpha = 0.3) +
+  geom_point(data = variog_expvarhhs_df %>% filter(formula == "p_modsev~1"), aes(x = dist, y = gamma)) + # replaced temp_expvar with variog_expvar_df
+  geom_text(data = variog_expvarhhs_df %>% filter(formula == "p_modsev~1"), aes(x = dist, y = 0.06*0.95, label = np),
+            size = 2) + # empirical variog, does not depend on model
+  geom_line(data = variog_linehhs_df %>% filter(formula == "p_modsev~1"), aes(x = dist, y = gamma, color = model)) +
+  geom_vline(data = variog_statshhs_df %>% filter(formula == "p_modsev~1"), aes(xintercept = effrange, color = model),
+             lty = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = variog_colors,
+                     labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
+  scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
+  labs(x = "Distance (km)",
+       y = "Semivariance",
+       color = "Fitted model",
+       fill = "") +
+  coord_cartesian(x = c(0, max((variog_expvarhhs_df%>% filter(formula == "p_modsev~1")) %>% pull(dist))),
+                  y = c(0, 0.25)) +
+  theme_classic() +
+  theme(title = element_text(size = 10),
+        panel.grid.major = element_line(color = "grey95"),
+  ) + # legend.position = "none"
+  guides(fill  = guide_legend(order = 2),
+         color = guide_legend(order = 1))
+plot_modsev.hh
+
+# putting them all together
+semivar_plots.hh <- ggpubr::ggarrange(plot_any.hh, plot_mild.hh, plot_modsev.hh,
+                                   nrow = 1, common.legend = T, legend = "right")
+semivar_plots.hh
+
+# saving it
+ggsave("figures/hh_variogram.pdf", semivar_plots.hh)
 
 #### repeating Moran's I at village level ####
 # not sure if this will work as the prevalence estimates in the houses will be crude (ie 0, 0.5, or 1 given the low n in each household)
@@ -609,98 +727,6 @@ village.morans %>%
   # according to this you need about 50 data points to make the semivariogram worthwhile
   # and my class notes recommend >50 points in total and each bin (group of points of similar distances apart) should have ≥30 pairwise comparisons
   # lastly the data needs to be normally distributed, otherwise it needs to be transformed.
-
-
-
-
-
-
-
-
-## `get_variog_plot`: plots variograms across 4 survey time points
-# variog_results
-# permute_results
-# returns figure containing 4 variogram plots, one for each survey point
-get_variog_plot <- function(permute_results, variog_line, variog_stats, variog_expvar, input_title){
-  
-  # initialize container to save plots
-  variog_plot_list <- list()
-  
-  #for(s in survey_list){
-    
-    temp_permute <- permute_results #%>% filter(survey == s)
-    temp_line <- variog_line #%>% filter(survey == s)
-    temp_stats <- variog_stats #%>% filter(survey == s)
-    temp_expvar <- variog_expvar #%>% filter(survey == s)
-    
-    # create variogram plot of points and each model fit
-    temp_plot <- ggplot() +
-      geom_ribbon(data = temp_permute,
-                  aes(x = dist, ymin = q0.025, ymax = q0.975, fill = fill_flag),
-                  alpha = 0.3) +
-      geom_point(data = temp_expvar, aes(x = dist, y = gamma)) + # empirical variog, does not depend on model
-      geom_text(data = temp_expvar, aes(x = dist, y = 0.06*0.95, label = np),
-                size = 2) + # empirical variog, does not depend on model
-      geom_line(data = temp_line, aes(x = dist, y = gamma, color = model)) +
-      geom_vline(data = temp_stats, aes(xintercept = effrange, color = model),
-                 lty = "dashed", show.legend = FALSE) +
-      scale_color_manual(values = variog_colors,
-                         labels = c("Exp" = "Exponential", "Mat" = "Matern", "Sph" = "Spherical")) +
-      scale_fill_manual(values = c("1" = "grey"), labels = c("1" = "Monte Carlo\nenvelope")) +
-      labs(x = "Distance (km)",
-           y = "Semivariance",
-           color = "Fitted model",
-           fill = "") +
-      coord_cartesian(x = c(0, max(temp_expvar %>% pull(dist))),
-                      y = c(0, 0.062)) +
-      theme_classic() +
-      theme(title = element_text(size = 10),
-            panel.grid.major = element_line(color = "grey95"),
-            legend.position = "none") +
-      guides(fill  = guide_legend(order = 2),
-             color = guide_legend(order = 1))
-    
-    # if(s != 0){
-      temp_plot <- temp_plot +
-        theme(axis.title.y = element_blank(),
-              axis.text.y = element_blank(),
-              axis.ticks.y = element_blank(),
-              axis.line.y = element_blank())
-    # }
-    
-    # if(s == 0){
-    #   temp_plot <- temp_plot +
-    #     geom_text(aes(x = 8, y = 0.062), label = "Bin sample sizes", size = 3) +
-    #     theme(plot.margin = unit(c(0.3,0,0.3,1), 'lines'))
-    # }
-    
-    # if(s == 36){
-    #   temp_plot <- temp_plot + 
-    #     theme(legend.position = "right",
-    #           legend.title = element_text(size = 10),
-    #           legend.text = element_text(size = 8))
-    # }
-    
-    variog_plot_list <- c(variog_plot_list, list(temp_plot))
-  # }
-  
-  variog_plot <- arrangeGrob(grobs = variog_plot_list, nrow = 1, widths = c(1.2,1,1,1.6),
-                             top = input_title)
-  return(variog_plot)
-}
-
-variog_plots <- lapply(c("p_any~1", "p_mild~1", "p_modsev~1"),
-                       function(x){
-                         get_variog_plot(
-                           permute_results = variog_perm_results_df %>% filter(formula == x),
-                           variog_expvar = variog_expvar_df %>% filter(formula == x),
-                           variog_line = variog_line_df %>% filter(formula == x),
-                           variog_stats = variog_stats_df %>% filter(formula == x),
-                           input_title = paste0("Variograms by study month: ", x)
-                         )})
-
-# not working just yet but will come back and try to plot these.
-
 
 #### old code ####
 # # population data from 2017 alto amazonas health network census
