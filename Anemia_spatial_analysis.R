@@ -26,16 +26,29 @@ data <- read_dta("anemia_alto_amazonas_abril.dta") %>%
   group_by(community) %>%
   summarise(n_tested=sum(!is.na(age)),
             n_any_anemia=sum(anemia.f %in% c("mild","moderate","severe")),
-            n_mild=sum(anemia.f=="mild"),
+            # n_mild=sum(anemia.f=="mild"),
             # grouping moderate and severe together due to the low number of severe cases
             n_modsev=sum(anemia.f %in% c("moderate","severe")),
             p_any=n_any_anemia/n_tested,
-            p_mild=n_mild/n_tested,
+            # p_mild=n_mild/n_tested,
             p_modsev=n_modsev/n_tested,
             # going for medians to get village midpoint as often there were a few houses located very far away
             lat=median(gps_lat, na.rm = T),
-            lon=median(gps_long, na.rm = T))
-data
+            lon=median(gps_long, na.rm = T)) %>%
+  # ggplot(data=data,aes(x=p_any)) + geom_histogram() # does not appear normal
+  # ggplot(data=data,aes(x=p_modsev)) + geom_histogram() # does not appear normal
+  # transforming to the empirical logit scale
+  mutate(any.logit=log((n_any_anemia + 0.5) / (n_tested - n_any_anemia + 0.5)),
+         modsev.logit=log((n_modsev + 0.5) / (n_tested - n_modsev + 0.5)))
+
+# checking normality of transformed data
+ggplot(data, aes(x=p_any)) + geom_histogram(bins = 10)
+ggplot(data, aes(x=any.logit)) + geom_histogram(bins = 10) # maybe it is more normal??
+ggplot(data, aes(x=modsev.logit)) + geom_histogram(bins = 10)
+ggplot(data, aes(x=p_modsev)) + geom_histogram(bins = 10) # this is definitely more normal
+
+# check for duplicates
+data %>% 
 
 # household level
 # not sure if this will work statistically given each household has a very small N but will give it a shot later if I have the time
@@ -60,10 +73,18 @@ data.hhs <- read_dta("anemia_alto_amazonas_abril.dta") %>%
             # going for medians to get village midpoint as often there were a few houses located very far away
             lat=median(gps_lat, na.rm = T),
             lon=median(gps_long, na.rm = T)) %>%
+  # transforming to the empirical logit scale
+  mutate(any.logit=log((n_any_anemia + 0.5) / (n_tested - n_any_anemia + 0.5)),
+         modsev.logit=log((n_modsev + 0.5) / (n_tested - n_modsev + 0.5)))
   # filtering out missing gps values
   filter(!is.na(lat) & !is.na(lon)) %>%
-  ungroup()
-data.hhs
+  ungroup() 
+
+# checking normality
+ggplot(data.hhs, aes(x=p_any)) + geom_histogram(bins = 10)
+ggplot(data.hhs, aes(x=any.logit)) + geom_histogram(bins = 10) # more normal
+ggplot(data.hhs, aes(x=p_modsev)) + geom_histogram(bins = 10)
+ggplot(data.hhs, aes(x=modsev.logit)) + geom_histogram(bins = 10)
 
 # checking for duplicates
 data.hhs %>% mutate(dups=n()) %>% filter(dups>1) # no duplicates
@@ -130,6 +151,231 @@ diag(dist_matrix_inv) <- 0
 ape::Moran.I(data$p_any, dist_matrix_inv) %>% as_tibble(.)
 ape::Moran.I(data$p_mild, dist_matrix_inv) %>% as_tibble(.)
 ape::Moran.I(data$p_modsev, dist_matrix_inv) %>% as_tibble(.) # none are significant likely due to the small sample size
+
+#### repeating Moran's I at village level ####
+# not sure if this will work as the prevalence estimates in the houses will be crude (ie 0, 0.5, or 1 given the low n in each household)
+
+# converting my data to SF
+data_spatial.hhs <- data.hhs %>% 
+  # just applying this to one village
+  filter(community=="Panam") %>%
+  st_as_sf(coords = c("lon","lat"), crs = crs) %>%
+  as("Spatial")
+
+# create symmetric matrix of distances between every point
+dist_matrix.hhs <- sapply(1:nrow(data_spatial.hhs),
+                          # using the distGeo method accounts for globe curvature when calculating distance
+                          function(x) geosphere::distGeo(p1 = data_spatial.hhs, p2 = data_spatial.hhs[x,]))
+
+# take inverse of distance 
+dist_matrix_inv.hhs <- 1/dist_matrix.hhs # due to duplicates with 0 distance between them this is leading to 1/0 = Inf
+# replace the Inf values in the diagonals with 0
+diag(dist_matrix_inv.hhs) <- 0
+
+# estimate moran's I and statistical significance for each level of anemia
+ape::Moran.I(filter(data.hhs, community=="Panam")$p_any, dist_matrix_inv.hhs) %>% as_tibble(.)
+ape::Moran.I(filter(data.hhs, community=="Panam")$p_mild, dist_matrix_inv.hhs) %>% as_tibble(.)
+ape::Moran.I(filter(data.hhs, community=="Panam")$p_modsev, dist_matrix_inv.hhs) %>% as_tibble(.) # none are significant likely due to the small sample size
+
+# it works for one village, now I have to create a function that will apply it to all 21
+village.moran <- function(outcome_var, village) {
+  
+  # 1. create a df for just the village
+  temp_df <- data.hhs %>%
+    filter(community == village)
+  
+  # 2. convert to spatial format
+  temp_df_spatial <- temp_df %>% 
+    st_as_sf(coords = c("lon","lat"), crs = crs) %>%
+    as("Spatial")
+  
+  # 2. create symmetric matrix of distances between every point
+  dist_matrix <- sapply(1:nrow(temp_df_spatial),
+                        function(x) geosphere::distGeo(p1 = temp_df_spatial, p2 = temp_df_spatial[x,]))
+  
+  # 3. take inverse of distance
+  dist_matrix_inv <- 1/dist_matrix
+  
+  # 4. replace the Inf values with 0 
+  diag(dist_matrix_inv) <- 0
+  
+  # 5. estimate Moran's I and p-value for each level of anemia
+  ret <- ape::Moran.I(temp_df %>% pull(outcome_var), dist_matrix_inv) %>% 
+    as_tibble() %>% 
+    mutate(outcome_var = outcome_var, village = village) %>%
+    select(village, outcome_var, observed, expected, p.value)
+  
+  # 6. bind all of these together
+  # ret <- rbind(any, mild, mod) %>% select(village, level, observed, expected, p.value)
+  
+  # 6. return the results
+  return(ret)
+  
+}
+
+village.moran("p_any", "Panam") # Works!
+
+village_list <- data.hhs %>% 
+  # filtering out these two since there are only two households with anemia/gps data and this is not enough for morans I
+  filter(!(community %in% c("Nuevo Barranquita","Corazon de Jesus"))) %>%
+  ungroup() %>%
+  # getting a unique list of the remaining village
+  distinct(.$community) %>% as.vector()
+village_list
+
+
+#### now to iterate it over every village ####
+moran.village <- mapply(village.moran,
+                        outcome_var = rep(c("p_any", "p_mild", "p_modsev"), each = 19),
+                        village = village_list,
+                        SIMPLIFY = F)
+
+nuevo_arica <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Nuevo Arica",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+dos_mayo <- mapply(village.moran,
+                   outcome_var = c("p_any", "p_mild", "p_modsev"),
+                   village = "Dos de Mayo",
+                   SIMPLIFY = F) %>%
+  bind_rows()
+
+bellavista_b <- mapply(village.moran,
+                       outcome_var = c("p_any", "p_mild", "p_modsev"),
+                       village = "Bellavista (Balsapuerto)",
+                       SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_papaplaya <- mapply(village.moran,
+                          outcome_var = c("p_any", "p_mild", "p_modsev"),
+                          village = "Nuevo Papaplaya",
+                          SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_barranquita <- mapply(village.moran,
+                            outcome_var = c("p_any", "p_mild", "p_modsev"),
+                            village = "Nuevo Barranquita",
+                            SIMPLIFY = F) %>%
+  bind_rows() # duplicate error, simply two households so not enough data for Moran's I
+
+corazon_de_jesus <- mapply(village.moran,
+                           outcome_var = c("p_any", "p_mild", "p_modsev"),
+                           village ="Corazon de Jesus",
+                           SIMPLIFY = F) %>%
+  bind_rows() # duplicate error
+
+bethel <- mapply(village.moran,
+                 outcome_var = c("p_any", "p_mild", "p_modsev"),
+                 village = "Bethel",
+                 SIMPLIFY = F) %>%
+  bind_rows()
+
+bellavista_j <- mapply(village.moran,
+                       outcome_var = c("p_any", "p_mild", "p_modsev"),
+                       village = "Bellavista (Jeberos)",
+                       SIMPLIFY = F) %>%
+  bind_rows()
+
+vista_allegre <- mapply(village.moran,
+                        outcome_var = c("p_any", "p_mild", "p_modsev"),
+                        village = "Vista Allegre",
+                        SIMPLIFY = F) %>%
+  bind_rows()
+
+huancayo <- mapply(village.moran,
+                   outcome_var = c("p_any", "p_mild", "p_modsev"),
+                   village = "Huancayo",
+                   SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_arica <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "Nuevo Arica",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+sies_julio <- mapply(village.moran,
+                     outcome_var = c("p_any", "p_mild", "p_modsev"),
+                     village = "06 de Julio",
+                     SIMPLIFY = F) %>%
+  bind_rows()
+
+tamarate <- mapply(village.moran,
+                   outcome_var = c("p_any", "p_mild", "p_modsev"),
+                   village = "Tamarate",
+                   SIMPLIFY = F) %>%
+  bind_rows()
+
+huatapi <- mapply(village.moran,
+                  outcome_var = c("p_any", "p_mild", "p_modsev"),
+                  village = "Huatapi",
+                  SIMPLIFY = F) %>%
+  bind_rows()
+
+union_campesino <- mapply(village.moran,
+                          outcome_var = c("p_any", "p_mild", "p_modsev"),
+                          village = "Union Campesino",
+                          SIMPLIFY = F) %>%
+  bind_rows()
+
+nuevo_iquitos <- mapply(village.moran,
+                        outcome_var = c("p_any", "p_mild", "p_modsev"),
+                        village = "Nuevo Iquitos",
+                        SIMPLIFY = F) %>%
+  bind_rows()
+
+angamos <- mapply(village.moran,
+                  outcome_var = c("p_any", "p_mild", "p_modsev"),
+                  village = "Angamos",
+                  SIMPLIFY = F) %>%
+  bind_rows()
+
+san_antonio <- mapply(village.moran,
+                      outcome_var = c("p_any", "p_mild", "p_modsev"),
+                      village = "San Antonio",
+                      SIMPLIFY = F) %>%
+  bind_rows()
+
+panam <- mapply(village.moran,
+                outcome_var = c("p_any", "p_mild", "p_modsev"),
+                village = "Panam",
+                SIMPLIFY = F) %>%
+  bind_rows()
+
+maranatha <- mapply(village.moran,
+                    outcome_var = c("p_any", "p_mild", "p_modsev"),
+                    village = "Maranatha",
+                    SIMPLIFY = F) %>%
+  bind_rows()
+
+loma_linda <- mapply(village.moran,
+                     outcome_var = c("p_any", "p_mild", "p_modsev"),
+                     village = "Loma Linda",
+                     SIMPLIFY = F) %>%
+  bind_rows()
+
+centro_america <- mapply(village.moran,
+                         outcome_var = c("p_any", "p_mild", "p_modsev"),
+                         village = "Centro America",
+                         SIMPLIFY = F) %>%
+  bind_rows() # duplicate error?
+
+village.morans <- rbind(centro_america, loma_linda, maranatha, panam, san_antonio, angamos, 
+                        nuevo_iquitos, union_campesino, huatapi, tamarate, sies_julio, nuevo_arica, 
+                        huancayo, vista_allegre, bellavista_j, bethel, nuevo_papaplaya, bellavista_b, 
+                        dos_mayo, nuevo_arica)
+village.morans
+
+ggplot(village.morans, aes(x=observed)) + 
+  geom_histogram(bins = 20) + 
+  facet_grid(~outcome_var)
+
+village.morans %>%
+  group_by(outcome_var) %>%
+  summarise(mean=mean(observed),
+            sd=sd(observed))
 
 #### semi-variograms ####
 
@@ -378,7 +624,7 @@ semivar_plots
 
 # saving
 setwd("~/Library/Mobile Documents/com~apple~CloudDocs/R projects/aa-anemia")
-ggsave("figures/village_semivariogram.pdf", semivar_plots)
+ggsave("figures/village_semivariogram.eps", semivar_plots, device = cairo_ps) # this allows me to save eps with alpha
 
 #### repeating semivariogram at the hh level ####
 n_permute_variog <- 200
@@ -494,233 +740,9 @@ semivar_plots.hh <- ggpubr::ggarrange(plot_any.hh, plot_mild.hh, plot_modsev.hh,
 semivar_plots.hh
 
 # saving it
-ggsave("figures/hh_variogram.pdf", semivar_plots.hh)
-
-#### repeating Moran's I at village level ####
-# not sure if this will work as the prevalence estimates in the houses will be crude (ie 0, 0.5, or 1 given the low n in each household)
-
-# converting my data to SF
-data_spatial.hhs <- data.hhs %>% 
-  # just applying this to one village
-  filter(community=="Panam") %>%
-  st_as_sf(coords = c("lon","lat"), crs = crs) %>%
-  as("Spatial")
-
-# create symmetric matrix of distances between every point
-dist_matrix.hhs <- sapply(1:nrow(data_spatial.hhs),
-                      # using the distGeo method accounts for globe curvature when calculating distance
-                      function(x) geosphere::distGeo(p1 = data_spatial.hhs, p2 = data_spatial.hhs[x,]))
-
-# take inverse of distance 
-dist_matrix_inv.hhs <- 1/dist_matrix.hhs # due to duplicates with 0 distance between them this is leading to 1/0 = Inf
-# replace the Inf values in the diagonals with 0
-diag(dist_matrix_inv.hhs) <- 0
-
-# estimate moran's I and statistical significance for each level of anemia
-ape::Moran.I(filter(data.hhs, community=="Panam")$p_any, dist_matrix_inv.hhs) %>% as_tibble(.)
-ape::Moran.I(filter(data.hhs, community=="Panam")$p_mild, dist_matrix_inv.hhs) %>% as_tibble(.)
-ape::Moran.I(filter(data.hhs, community=="Panam")$p_modsev, dist_matrix_inv.hhs) %>% as_tibble(.) # none are significant likely due to the small sample size
-
-# it works for one village, now I have to create a function that will apply it to all 21
-village.moran <- function(outcome_var, village) {
-  
-  # 1. create a df for just the village
-  temp_df <- data.hhs %>%
-    filter(community == village)
-  
-  # 2. convert to spatial format
-  temp_df_spatial <- temp_df %>% 
-    st_as_sf(coords = c("lon","lat"), crs = crs) %>%
-    as("Spatial")
-  
-  # 2. create symmetric matrix of distances between every point
-  dist_matrix <- sapply(1:nrow(temp_df_spatial),
-                            function(x) geosphere::distGeo(p1 = temp_df_spatial, p2 = temp_df_spatial[x,]))
-  
-  # 3. take inverse of distance
-  dist_matrix_inv <- 1/dist_matrix
-  
-  # 4. replace the Inf values with 0 
-  diag(dist_matrix_inv) <- 0
-  
-  # 5. estimate Moran's I and p-value for each level of anemia
-  ret <- ape::Moran.I(temp_df %>% pull(outcome_var), dist_matrix_inv) %>% 
-    as_tibble() %>% 
-    mutate(outcome_var = outcome_var, village = village) %>%
-    select(village, outcome_var, observed, expected, p.value)
-  
-  # 6. bind all of these together
-  # ret <- rbind(any, mild, mod) %>% select(village, level, observed, expected, p.value)
-  
-  # 6. return the results
-  return(ret)
-  
-}
-
-village.moran("p_any", "Panam") # Works!
-
-village_list <- data.hhs %>% 
-  # filtering out these two since there are only two households with anemia/gps data and this is not enough for morans I
-  filter(!(community %in% c("Nuevo Barranquita","Corazon de Jesus"))) %>%
-  ungroup() %>%
-  # getting a unique list of the remaining village
-  distinct(.$community) %>% as.vector()
-village_list
+ggsave("figures/hh_variogram.eps", semivar_plots.hh, device = cairo_ps)
 
 
-#### now to iterate it over every village ####
-moran.village <- mapply(village.moran,
-                        outcome_var = rep(c("p_any", "p_mild", "p_modsev"), each = 19),
-                        village = village_list,
-                        SIMPLIFY = F)
-
-nuevo_arica <- mapply(village.moran,
-       outcome_var = c("p_any", "p_mild", "p_modsev"),
-       village = "Nuevo Arica",
-       SIMPLIFY = F) %>%
-  bind_rows()
-
-dos_mayo <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Dos de Mayo",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-bellavista_b <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Bellavista (Balsapuerto)",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-nuevo_papaplaya <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Nuevo Papaplaya",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-nuevo_barranquita <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Nuevo Barranquita",
-                      SIMPLIFY = F) %>%
-  bind_rows() # duplicate error, simply two households so not enough data for Moran's I
-
-corazon_de_jesus <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village ="Corazon de Jesus",
-                      SIMPLIFY = F) %>%
-  bind_rows() # duplicate error
-
-bethel <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Bethel",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-bellavista_j <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Bellavista (Jeberos)",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-vista_allegre <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Vista Allegre",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-huancayo <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Huancayo",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-nuevo_arica <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Nuevo Arica",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-sies_julio <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "06 de Julio",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-tamarate <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Tamarate",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-huatapi <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Huatapi",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-union_campesino <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Union Campesino",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-nuevo_iquitos <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Nuevo Iquitos",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-angamos <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Angamos",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-san_antonio <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "San Antonio",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-panam <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Panam",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-maranatha <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Maranatha",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-loma_linda <- mapply(village.moran,
-                      outcome_var = c("p_any", "p_mild", "p_modsev"),
-                      village = "Loma Linda",
-                      SIMPLIFY = F) %>%
-  bind_rows()
-
-centro_america <- mapply(village.moran,
-                     outcome_var = c("p_any", "p_mild", "p_modsev"),
-                     village = "Centro America",
-                     SIMPLIFY = F) %>%
-  bind_rows() # duplicate error?
-
-village.morans <- rbind(centro_america, loma_linda, maranatha, panam, san_antonio, angamos, 
-                        nuevo_iquitos, union_campesino, huatapi, tamarate, sies_julio, nuevo_arica, 
-                        huancayo, vista_allegre, bellavista_j, bethel, nuevo_papaplaya, bellavista_b, 
-                        dos_mayo, nuevo_arica)
-village.morans
-
-ggplot(village.morans, aes(x=observed)) + 
-  geom_histogram(bins = 20) + 
-  facet_grid(~outcome_var)
-
-village.morans %>%
-  group_by(outcome_var) %>%
-  summarise(mean=mean(observed),
-            sd=sd(observed))
-  
 
 #### question: to repeat semivariograms at village level ####
 # https://link.springer.com/chapter/10.1007/978-94-011-1739-5_14
