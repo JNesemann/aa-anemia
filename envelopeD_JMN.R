@@ -1,4 +1,4 @@
-envelopeD <- function(cases, contr, nsims, rsplit, Rmax) {
+envelopeD_jmn <- function(cases, contr, nsims, rsplit, Rmax) {
   Dsim <- c() # we'll store our result in this object
   win <- cases$window
   x <- c(cases$x, contr$x)
@@ -12,6 +12,9 @@ envelopeD <- function(cases, contr, nsims, rsplit, Rmax) {
     simcontr <- ppp(x = x[cc == "control"], 
                     y = y[cc == "control"], 
                     window = win)
+    # rescaling each to km
+    # simcases.km <- rescale(simcases, 1000, "km")
+    # simcontr.km <- rescale(simcases, 1000, "km")
     
     Kcases <- Kest(simcases, 
                    correction = "isotropic", 
@@ -36,9 +39,9 @@ envelopeD <- function(cases, contr, nsims, rsplit, Rmax) {
                     rmax = Rmax)
   D <- Kcases$iso - Kcontrols$iso
   r <- Kcases$r
-  plot(NULL, xlab = "r (Km)", ylab = "Estimated D(r)",
+  plot(NULL, xlab = "Distance, Km", ylab = "Difference in K-functions",
        xlim = range(r), 
-       ylim = c(min(c(D, qts[1, ])), max(D, qts[1, ])))
+       ylim = c(-300, 250))
   polygon(c(r, rev(r)), c(qts[1, ], rev(qts[2, ])), 
           col = "lightgrey", border = NA)
   lines(r, D)
